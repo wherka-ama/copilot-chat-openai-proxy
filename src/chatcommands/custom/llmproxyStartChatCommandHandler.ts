@@ -8,6 +8,13 @@ import http from "http";
 import { validate } from "jsonschema";
 
 import { log } from "../../lib/logger";
+import {
+  generateCompletionId,
+  formatTextChunk,
+  formatToolCallChunk,
+  formatFinishChunk,
+  formatDone,
+} from "../../lib/sseFormatter";
 
 import path from "path";
 import {
@@ -216,14 +223,18 @@ export class LlmproxyStartChatCommandHandler extends ChatCommandHandler {
             },
             responses: {
               "200": {
-                description: "Successful chat completion",
+                description:
+                  "Successful chat completion. When stream=false, returns JSON. When stream=true, returns SSE (text/event-stream) with chunked deltas followed by data: [DONE].",
                 content: {
                   "application/json": {
                     schema: {
                       type: "object",
                       properties: {
                         id: { type: "string" },
-                        object: { type: "string" },
+                        object: {
+                          type: "string",
+                          enum: ["chat.completion"],
+                        },
                         created: { type: "number" },
                         model: { type: "string" },
                         choices: {
@@ -244,6 +255,13 @@ export class LlmproxyStartChatCommandHandler extends ChatCommandHandler {
                           },
                         },
                       },
+                    },
+                  },
+                  "text/event-stream": {
+                    schema: {
+                      type: "string",
+                      description:
+                        "SSE stream of chat.completion.chunk objects. Each line: data: {JSON}\\n\\n. Final line: data: [DONE]\\n\\n",
                     },
                   },
                 },
@@ -408,68 +426,112 @@ export class LlmproxyStartChatCommandHandler extends ChatCommandHandler {
             vsCodeElements?.token,
           );
 
-          const toolCalls = Array<ToolCall>();
-
-          for await (const chunk of chatResponse.stream) {
-            if (chunk instanceof LanguageModelTextPart) {
-              processResult += chunk.value;
-            } else if (chunk instanceof LanguageModelToolCallPart) {
-              toolCalls.push({
-                id: chunk.callId,
-                type: "function",
-                function: {
-                  name: chunk.name,
-                  arguments: JSON.stringify(chunk.input),
-                },
-              });
-            }
-          }
-
-          let response;
-
-          if (toolCalls.length > 0) {
-            response = {
-              id: `chatcmpl-${Date.now()}`,
-              object: "chat.completion",
-              created: Math.floor(Date.now() / 1000),
-              model: request.model,
-              choices: [
-                {
-                  message: {
-                    role: "assistant",
-                    content: "",
-                    tool_calls: toolCalls,
-                  },
-                  finish_reason: "tool_calls",
-                  index: 0,
-                },
-              ],
-            } as ChatCompletionResponse;
-          } else {
-            response = {
-              id: `chatcmpl-${Date.now()}`,
-              object: "chat.completion",
-              created: Math.floor(Date.now() / 1000),
-              model: request.model,
-              choices: [
-                {
-                  message: {
-                    role: "assistant",
-                    content: processResult,
-                  },
-                  finish_reason: "stop",
-                  index: 0,
-                },
-              ],
-            } as ChatCompletionResponse;
-          }
-
           if (request.stream) {
+            // --- Streaming path: emit SSE events as chunks arrive ---
             res.setHeader("Content-Type", "text/event-stream");
             res.setHeader("Cache-Control", "no-cache");
             res.setHeader("Connection", "keep-alive");
-            //TODO: Implementation of streaming response
+            res.flushHeaders();
+
+            const completionId = generateCompletionId();
+            const toolCalls = Array<ToolCall>();
+            let isFirstTextChunk = true;
+            let toolIndex = 0;
+
+            try {
+              for await (const chunk of chatResponse.stream) {
+                if (chunk instanceof LanguageModelTextPart) {
+                  const role = isFirstTextChunk ? "assistant" : undefined;
+                  res.write(formatTextChunk(completionId, request.model, chunk.value, role));
+                  isFirstTextChunk = false;
+                } else if (chunk instanceof LanguageModelToolCallPart) {
+                  res.write(formatToolCallChunk(
+                    completionId,
+                    request.model,
+                    { callId: chunk.callId, name: chunk.name, input: chunk.input },
+                    toolIndex++,
+                  ));
+                  toolCalls.push({
+                    id: chunk.callId,
+                    type: "function",
+                    function: {
+                      name: chunk.name,
+                      arguments: JSON.stringify(chunk.input),
+                    },
+                  });
+                }
+              }
+
+              const finishReason = toolCalls.length > 0 ? "tool_calls" : "stop";
+              res.write(formatFinishChunk(completionId, request.model, finishReason));
+              res.write(formatDone());
+            } catch (streamError) {
+              console.error("SSE stream error:", streamError);
+              // Attempt to send an error event before closing
+              const errorMsg = streamError instanceof Error ? streamError.message : "Unknown stream error";
+              res.write(`data: ${JSON.stringify({ error: { message: errorMsg, type: "stream_error" } })}\n\n`);
+              res.write(formatDone());
+            } finally {
+              res.end();
+            }
           } else {
+            // --- Non-streaming path: accumulate then respond ---
+            const toolCalls = Array<ToolCall>();
+
+            for await (const chunk of chatResponse.stream) {
+              if (chunk instanceof LanguageModelTextPart) {
+                processResult += chunk.value;
+              } else if (chunk instanceof LanguageModelToolCallPart) {
+                toolCalls.push({
+                  id: chunk.callId,
+                  type: "function",
+                  function: {
+                    name: chunk.name,
+                    arguments: JSON.stringify(chunk.input),
+                  },
+                });
+              }
+            }
+
+            let response;
+
+            if (toolCalls.length > 0) {
+              response = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion",
+                created: Math.floor(Date.now() / 1000),
+                model: request.model,
+                choices: [
+                  {
+                    message: {
+                      role: "assistant",
+                      content: "",
+                      tool_calls: toolCalls,
+                    },
+                    finish_reason: "tool_calls",
+                    index: 0,
+                  },
+                ],
+              } as ChatCompletionResponse;
+            } else {
+              response = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion",
+                created: Math.floor(Date.now() / 1000),
+                model: request.model,
+                choices: [
+                  {
+                    message: {
+                      role: "assistant",
+                      content: processResult,
+                    },
+                    finish_reason: "stop",
+                    index: 0,
+                  },
+                ],
+              } as ChatCompletionResponse;
+            }
+
             res.json(response);
           }
         } catch (error) {
