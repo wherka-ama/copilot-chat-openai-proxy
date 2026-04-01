@@ -514,29 +514,49 @@ sequenceDiagram
 
 ## Advanced Features
 
-### Streaming Response (Future Implementation)
+### Streaming Response (SSE)
+
+When `stream: true` is set in the request, the server emits OpenAI-compatible
+Server-Sent Events as each chunk arrives from the VSCode Language Model API.
+The SSE formatting logic lives in `src/lib/sseFormatter.ts` (pure functions,
+fully unit-tested).
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Server
     participant Handler
-    participant Stream as Response Stream
+    participant SSE as sseFormatter
+    participant LM as VS Code LM API
+    participant Copilot as GitHub Copilot
     
     Client->>Server: POST {stream: true}
     Server->>Handler: Process with stream=true
-    Handler->>Stream: setHeader("Content-Type", "text/event-stream")
-    Handler->>Stream: setHeader("Cache-Control", "no-cache")
+    Handler->>Handler: Set SSE headers + flushHeaders()
+    Handler->>SSE: generateCompletionId()
+    Handler->>LM: sendRequest(messages, options)
+    LM->>Copilot: Forward to Copilot API
     
-    loop For each chunk
-        Handler->>Handler: Receive LM chunk
-        Handler->>Handler: Format as SSE
-        Handler->>Stream: write("data: " + JSON + "\n\n")
-        Stream-->>Client: Server-Sent Event
+    loop For each chunk from chatResponse.stream
+        Copilot-->>LM: chunk
+        LM-->>Handler: LanguageModelPart
+        
+        alt LanguageModelTextPart
+            Handler->>SSE: formatTextChunk(id, model, text, role?)
+            SSE-->>Handler: "data: {JSON}\n\n"
+            Handler->>Client: res.write(SSE event)
+        else LanguageModelToolCallPart
+            Handler->>SSE: formatToolCallChunk(id, model, toolCall, index)
+            SSE-->>Handler: "data: {JSON}\n\n"
+            Handler->>Client: res.write(SSE event)
+        end
     end
     
-    Handler->>Stream: write("data: [DONE]\n\n")
-    Handler->>Stream: end()
+    Handler->>SSE: formatFinishChunk(id, model, "stop"|"tool_calls")
+    Handler->>Client: res.write(finish event)
+    Handler->>SSE: formatDone()
+    Handler->>Client: res.write("data: [DONE]\n\n")
+    Handler->>Client: res.end()
 ```
 
 ### Multi-Model Support
